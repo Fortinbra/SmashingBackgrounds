@@ -6,28 +6,66 @@
     This script fetches wallpapers from a Smashing Magazine desktop wallpaper article,
     prioritizing the largest 16:9 aspect ratio images available. It creates a folder
     named with the month and year, and downloads all wallpapers to that folder.
+    
+    If no URL is provided, the script automatically builds the URL for the current month's
+    wallpaper collection based on the predictable Smashing Magazine URL pattern.
 
 .PARAMETER Url
-    The URL of the Smashing Magazine wallpaper article.
+    The URL of the Smashing Magazine wallpaper article. Optional - if not provided,
+    the script will automatically generate the URL for the current month.
 
 .PARAMETER OutputPath
     The base path where the wallpaper folder will be created. Defaults to current directory.
 
 .EXAMPLE
+    .\Download-SmashingWallpapers.ps1
+    
+    Downloads wallpapers for the current month automatically.
+
+.EXAMPLE
     .\Download-SmashingWallpapers.ps1 -Url "https://www.smashingmagazine.com/2025/12/desktop-wallpaper-calendars-january-2026/"
 
 .EXAMPLE
-    .\Download-SmashingWallpapers.ps1 -Url "https://www.smashingmagazine.com/2025/12/desktop-wallpaper-calendars-january-2026/" -OutputPath "C:\Wallpapers"
+    .\Download-SmashingWallpapers.ps1 -OutputPath "C:\Wallpapers"
+    
+    Downloads current month's wallpapers to the specified folder.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$false)]
     [string]$Url,
     
     [Parameter(Mandatory=$false)]
     [string]$OutputPath = "."
 )
+
+# Function to build the Smashing Magazine wallpaper URL for a given month
+function Get-SmashingWallpaperUrl {
+    param(
+        [DateTime]$Date = (Get-Date)
+    )
+    
+    # Smashing Magazine publishes wallpapers the month before
+    # e.g., January 2026 wallpapers are published in December 2025
+    $publishDate = $Date.AddMonths(-1)
+    $publishYear = $publishDate.Year
+    $publishMonth = $publishDate.Month.ToString("00")
+    
+    $wallpaperMonth = $Date.ToString("MMMM").ToLower()
+    $wallpaperYear = $Date.Year
+    
+    $url = "https://www.smashingmagazine.com/$publishYear/$publishMonth/desktop-wallpaper-calendars-$wallpaperMonth-$wallpaperYear/"
+    
+    return $url
+}
+
+# If no URL provided, build it automatically for the current month
+if ([string]::IsNullOrWhiteSpace($Url)) {
+    $Url = Get-SmashingWallpaperUrl -Date (Get-Date)
+    Write-Host "No URL provided. Using current month's wallpaper URL:" -ForegroundColor Cyan
+    Write-Host "  $Url" -ForegroundColor White
+}
 
 # Common 16:9 resolutions in order of preference (largest first)
 $Preferred16x9Resolutions = @(
@@ -96,29 +134,55 @@ function Get-MonthYearFromUrl {
     return $date.ToString("MMMM_yyyy")
 }
 
-function Select-Best16x9Image {
+function Test-IsWidescreen {
+    param([int]$Width, [int]$Height)
+    
+    if ($Height -eq 0) { return $false }
+    # Widescreen = wider than 4:3 (ratio > 1.33)
+    $ratio = $Width / $Height
+    return $ratio -gt 1.33
+}
+
+function Select-BestWallpaper {
     param([array]$ImageLinks)
     
-    $candidates = @()
+    $candidates16x9 = @()
+    $candidatesWidescreen = @()
     
     foreach ($link in $ImageLinks) {
         $resolution = Get-ResolutionFromText -Text $link.Text
         
-        if ($resolution -and (Test-Is16x9 -Width $resolution.Width -Height $resolution.Height)) {
-            $candidates += @{
+        if ($resolution) {
+            $candidate = @{
                 Url = $link.Href
                 Width = $resolution.Width
                 Height = $resolution.Height
                 Name = $resolution.Name
                 Text = $link.Text
             }
+            
+            if (Test-Is16x9 -Width $resolution.Width -Height $resolution.Height) {
+                $candidates16x9 += $candidate
+            }
+            elseif (Test-IsWidescreen -Width $resolution.Width -Height $resolution.Height) {
+                $candidatesWidescreen += $candidate
+            }
         }
     }
     
-    # Sort by total pixels (width * height) descending
-    $best = $candidates | Sort-Object { $_.Width * $_.Height } -Descending | Select-Object -First 1
+    # Prefer 16:9, sorted by total pixels (width * height) descending
+    if ($candidates16x9.Count -gt 0) {
+        $best = $candidates16x9 | Sort-Object { $_.Width * $_.Height } -Descending | Select-Object -First 1
+        return @{ Image = $best; Type = "16:9" }
+    }
     
-    return $best
+    # Fallback to largest widescreen image
+    if ($candidatesWidescreen.Count -gt 0) {
+        $best = $candidatesWidescreen | Sort-Object { $_.Width * $_.Height } -Descending | Select-Object -First 1
+        return @{ Image = $best; Type = "widescreen" }
+    }
+    
+    return $null
 }
 
 Write-Host "Fetching wallpaper page: $Url" -ForegroundColor Cyan
@@ -161,22 +225,28 @@ try {
         }
     }
     
-    # Fallback to regex if parsed links aren't available
+    # Fallback to regex if parsed links aren't available or insufficient
     if ($allLinks.Count -eq 0) {
         Write-Host "Using fallback regex parsing..." -ForegroundColor Yellow
-        $linkMatches = [regex]::Matches($html, '<a[^>]+href=["'']([^"'']+)["''][^>]*>([^<]+)</a>')
-        foreach ($match in $linkMatches) {
-            $allLinks += @{
-                Href = $match.Groups[1].Value
-                Text = $match.Groups[2].Value.Trim()
-            }
+    }
+    
+    # Always use regex to find wallpaper resolution links since UseBasicParsing may not populate Links properly
+    # Pattern handles both quoted and unquoted href attributes:
+    # <a href="...url...">1920x1080</a> OR <a href=...url... title="...">1920×1080</a>
+    $linkMatches = [regex]::Matches($html, '<a\s+href="?([^"\s>]+)"?\s*[^>]*>(\d+[x×]\d+)</a>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    Write-Host "Found $($linkMatches.Count) resolution links via regex" -ForegroundColor Cyan
+    
+    foreach ($match in $linkMatches) {
+        $allLinks += @{
+            Href = $match.Groups[1].Value
+            Text = $match.Groups[2].Value.Trim()
         }
     }
     
-    # Group links by wallpaper (they typically come in groups with different resolutions)
+    # Group links by wallpaper name extracted from URL
+    # URL pattern: .../wallpapers/jan-26/WALLPAPER-NAME/cal/...
+    # or: .../wallpapers/jan-26/WALLPAPER-NAME/nocal/...
     $wallpaperGroups = @{}
-    $currentGroup = @()
-    $groupIndex = 0
     
     foreach ($link in $allLinks) {
         $href = $link.Href
@@ -186,39 +256,47 @@ try {
         $resolution = Get-ResolutionFromText -Text $text
         
         if ($resolution) {
-            $currentGroup += @{
+            # Extract wallpaper name from URL path
+            # Pattern: /wallpapers/xxx/WALLPAPER-NAME/(cal|nocal)/
+            $wallpaperName = "unknown"
+            if ($href -match '/wallpapers/[^/]+/([^/]+)/(cal|nocal)/') {
+                $wallpaperName = $matches[1]
+            }
+            elseif ($href -match '/([^/]+)-nocal-\d+x\d+\.\w+$') {
+                $wallpaperName = $matches[1]
+            }
+            elseif ($href -match '/([^/]+)-cal-\d+x\d+\.\w+$') {
+                $wallpaperName = $matches[1]
+            }
+            
+            if (-not $wallpaperGroups.ContainsKey($wallpaperName)) {
+                $wallpaperGroups[$wallpaperName] = @()
+            }
+            
+            $wallpaperGroups[$wallpaperName] += @{
                 Href = $href
                 Text = $text
                 Resolution = $resolution
             }
         }
-        else {
-            # If we have accumulated links and hit a non-resolution link, save the group
-            if ($currentGroup.Count -gt 0) {
-                $wallpaperGroups["Group_$groupIndex"] = $currentGroup
-                $currentGroup = @()
-                $groupIndex++
-            }
-        }
-    }
-    
-    # Don't forget the last group
-    if ($currentGroup.Count -gt 0) {
-        $wallpaperGroups["Group_$groupIndex"] = $currentGroup
     }
     
     Write-Host "Found $($wallpaperGroups.Count) wallpaper groups" -ForegroundColor Cyan
     
     $downloadCount = 0
+    $skippedCount = 0
+    $count16x9 = 0
+    $countWidescreen = 0
     
     foreach ($groupName in $wallpaperGroups.Keys | Sort-Object) {
         $group = $wallpaperGroups[$groupName]
         
-        # Select the best 16:9 image from this group
-        $bestImage = Select-Best16x9Image -ImageLinks $group
+        # Select the best wallpaper from this group (prefers 16:9, falls back to widescreen)
+        $result = Select-BestWallpaper -ImageLinks $group
         
-        if ($bestImage) {
-            $downloadCount++
+        if ($result) {
+            $bestImage = $result.Image
+            $imageType = $result.Type
             
             # Extract filename from URL
             $uri = [System.Uri]$bestImage.Url
@@ -232,12 +310,24 @@ try {
             
             # If filename is not descriptive, create one
             if ([string]::IsNullOrWhiteSpace($filename) -or $filename -notmatch '\.(jpg|jpeg|png|webp|bmp|gif)$') {
-                $filename = "wallpaper_${downloadCount}_$($bestImage.Name)${extension}"
+                $filename = "wallpaper_${groupName}_$($bestImage.Name)${extension}"
             }
             
             $outputFile = Join-Path -Path $outputFolder -ChildPath $filename
             
-            Write-Host "[$downloadCount] Downloading: $filename ($($bestImage.Name))" -ForegroundColor Yellow
+            # Skip if file already exists (idempotent)
+            if (Test-Path -Path $outputFile) {
+                $skippedCount++
+                Write-Host "[SKIP] $filename already exists" -ForegroundColor DarkGray
+                continue
+            }
+            
+            # Count by type only for files we actually download
+            if ($imageType -eq "16:9") { $count16x9++ } else { $countWidescreen++ }
+            $downloadCount++
+            
+            $typeLabel = if ($imageType -eq "16:9") { "" } else { " [widescreen]" }
+            Write-Host "[$downloadCount] Downloading: $filename ($($bestImage.Name))$typeLabel" -ForegroundColor Yellow
             Write-Host "    URL: $($bestImage.Url)" -ForegroundColor Gray
             
             try {
@@ -250,14 +340,17 @@ try {
         }
     }
     
-    if ($downloadCount -eq 0) {
-        Write-Host "No 16:9 wallpapers found. This might indicate:" -ForegroundColor Yellow
+    if ($downloadCount -eq 0 -and $skippedCount -eq 0) {
+        Write-Host "No wallpapers found. This might indicate:" -ForegroundColor Yellow
         Write-Host "  - The page structure has changed" -ForegroundColor Yellow
-        Write-Host "  - No 16:9 resolution wallpapers are available" -ForegroundColor Yellow
+        Write-Host "  - No widescreen resolution wallpapers are available" -ForegroundColor Yellow
         Write-Host "  - The parsing logic needs to be updated" -ForegroundColor Yellow
     }
     else {
-        Write-Host "`nSuccessfully downloaded $downloadCount wallpapers to: $outputFolder" -ForegroundColor Green
+        Write-Host "`n=== Summary ===" -ForegroundColor Cyan
+        Write-Host "Output folder: $outputFolder" -ForegroundColor White
+        Write-Host "  - Downloaded: $downloadCount (16:9: $count16x9, widescreen: $countWidescreen)" -ForegroundColor Green
+        Write-Host "  - Skipped (already exist): $skippedCount" -ForegroundColor DarkGray
     }
 }
 catch {
