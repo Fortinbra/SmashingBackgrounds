@@ -53,7 +53,8 @@ function Get-ResolutionFromText {
     param([string]$Text)
     
     # Try to match patterns like "1920×1080", "1920x1080", "1920 × 1080"
-    if ($Text -match '(\d{3,4})\s*[x×]\s*(\d{3,4})') {
+    # Updated to handle any number of digits for future-proofing
+    if ($Text -match '(\d+)\s*[x×]\s*(\d+)') {
         return @{
             Width = [int]$matches[1]
             Height = [int]$matches[2]
@@ -66,11 +67,27 @@ function Get-ResolutionFromText {
 function Get-MonthYearFromUrl {
     param([string]$Url)
     
-    # Try to extract month and year from URL patterns like:
+    # Try to extract month and year from various URL patterns:
     # .../2025/12/desktop-wallpaper-calendars-january-2026/
+    # .../desktop-wallpaper-calendars-january-2026/
+    # Try pattern with year/month in path and month-year at end
     if ($Url -match '/(\d{4})/(\d{2})/.*?-(\w+)-(\d{4})') {
         $month = $matches[3]
         $year = $matches[4]
+        return "${month}_${year}"
+    }
+    
+    # Try pattern with just month-year at end
+    if ($Url -match '/.*?-(\w+)-(\d{4})/?') {
+        $month = $matches[1]
+        $year = $matches[2]
+        return "${month}_${year}"
+    }
+    
+    # Try to extract from title or other patterns
+    if ($Url -match '(\w+)[\-_](\d{4})') {
+        $month = $matches[1]
+        $year = $matches[2]
         return "${month}_${year}"
     }
     
@@ -127,19 +144,43 @@ try {
     }
     
     # Parse HTML to find wallpaper sections
-    # Smashing Magazine typically structures wallpapers with headings and lists of resolution links
+    # Use PowerShell's HTML parsing for more robust link extraction
     
-    # Find all links that look like image downloads
-    $links = [regex]::Matches($html, '<a[^>]+href=["'']([^"'']+)["''][^>]*>([^<]+)</a>')
+    # Find all links from the parsed HTML
+    $allLinks = @()
+    
+    # Try to use parsed links if available
+    if ($response.Links) {
+        foreach ($link in $response.Links) {
+            if ($link.href -and $link.innerText) {
+                $allLinks += @{
+                    Href = $link.href
+                    Text = $link.innerText.Trim()
+                }
+            }
+        }
+    }
+    
+    # Fallback to regex if parsed links aren't available
+    if ($allLinks.Count -eq 0) {
+        Write-Host "Using fallback regex parsing..." -ForegroundColor Yellow
+        $linkMatches = [regex]::Matches($html, '<a[^>]+href=["'']([^"'']+)["''][^>]*>([^<]+)</a>')
+        foreach ($match in $linkMatches) {
+            $allLinks += @{
+                Href = $match.Groups[1].Value
+                Text = $match.Groups[2].Value.Trim()
+            }
+        }
+    }
     
     # Group links by wallpaper (they typically come in groups with different resolutions)
     $wallpaperGroups = @{}
     $currentGroup = @()
     $groupIndex = 0
     
-    foreach ($match in $links) {
-        $href = $match.Groups[1].Value
-        $text = $match.Groups[2].Value.Trim()
+    foreach ($link in $allLinks) {
+        $href = $link.Href
+        $text = $link.Text
         
         # Check if this is a resolution link
         $resolution = Get-ResolutionFromText -Text $text
@@ -183,9 +224,15 @@ try {
             $uri = [System.Uri]$bestImage.Url
             $filename = [System.IO.Path]::GetFileName($uri.LocalPath)
             
+            # Detect file extension from the URL or use a default
+            $extension = ".jpg"
+            if ($filename -match '\.(\w+)$') {
+                $extension = $matches[0]
+            }
+            
             # If filename is not descriptive, create one
-            if ([string]::IsNullOrWhiteSpace($filename) -or $filename -notmatch '\.(jpg|jpeg|png|webp)$') {
-                $filename = "wallpaper_${downloadCount}_$($bestImage.Name).jpg"
+            if ([string]::IsNullOrWhiteSpace($filename) -or $filename -notmatch '\.(jpg|jpeg|png|webp|bmp|gif)$') {
+                $filename = "wallpaper_${downloadCount}_$($bestImage.Name)${extension}"
             }
             
             $outputFile = Join-Path -Path $outputFolder -ChildPath $filename
