@@ -1,0 +1,26 @@
+# Downloaded wallpapers (month_year folders)
+*_20*/
+*_19*/
+
+# Common image formats
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+
+# PowerShell temporary files
+*.ps1~
+
+# Windows temporary files
+Thumbs.db
+desktop.ini
+
+# macOS temporary files
+.DS_Store
+
+# Test output
+test_output/
+temp/
+tmp/
